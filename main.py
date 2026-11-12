@@ -1,38 +1,21 @@
 #!/usr/bin/env python3
-"""Roblox Up-and-Coming forecast — make.fun roblox-up-and-coming-forecast-01.
+"""Reference model for roblox-up-and-coming-forecast-01 (PROTOTYPE for tuning only;
+the real entry is main.py, written by the parent agent — mirror this logic).
 
-Predicts the top 10 of Roblox's Up-and-Coming chart for every hour of the
-72-hour window after the deadline. One forecast serves all 72 hourly slots,
-so the honest forecast is the average of the per-hour rank distributions.
+Idea: per-game rank distribution diffused over the 24 hourly horizons of the
+scored window, then averaged (one forecast serves all 24 slots, so the honest
+forecast is the horizon-average). Components, all calibrated on the archive:
+  * recency-weighted rank velocity (momentum, shrunk) with saturating drift;
+  * Gaussian rank diffusion, sigma growing ~ sqrt(horizon);
+  * top-10 exit / 11-30 entry mass transfer, rank-dependent;
+  * #1 reign-age exit risk (a long #1 reign is fragile: DONT SPLASH vanished
+    after ~6.5 days at #1) with the heir (#2) absorbing most of the mass;
+  * per-place flattening (small for places 1-4, larger for 5-10) and an
+    unnamed share left at every place to cover off-chart entrants.
 
-Method (calibrated on the public chart archive, 30 Oct - 7 Nov 2026, plus
-backtests over 24 cutoffs inside that history):
-  * Per-game rank distribution diffused over horizons h = 1..72h
-    (Gaussian, sigma growing ~ sqrt(h); the top of the chart is stickier,
-    so ranks 1-2 diffuse much slower than the rest).
-  * Top-10 exit / rank 11-30 entry mass transfer, rank-dependent, scaled
-    from 24h rates to each horizon. Exit rates are measured per rank:
-    ranks 1-5 almost never leave the top 10, rank 6 ~0.21/24h, rank 7
-    ~0.30, rank 8 ~0.59, rank 9 ~0.82, rank 10 ~0.96 (softened x0.7 in the
-    tuned set: the raw 6.4h-gap extrapolation overstates exits).
-    Entries run ~5/day into the top 10, almost all from ranks 11-20.
-  * #1 reign-age exit risk: a long reign at #1 is fragile; a dethroned #1
-    usually falls to ranks 2-5 (70%) or leaves the chart (30%).
-  * Momentum is NOT used: backtests showed rank momentum hurts
-    (mean-reversion dominates this chart, as on Top Trending).
-  * Playing counts, votes, visits and favorites are NOT used.
-  * Per place, named probabilities sum to 0.75; 0.25 is left unnamed to
-    cover off-chart entrants, and places 5-10 are flattened toward
-    uniform (churn is highest there: a median 6 of 10 places change
-    between consecutive reads).
-
-Backtest (24 cutoffs, 72h ahead): mean log score -38.28 vs the house
-starter baseline's -46.54. Practice window (10 archive reads, 8-10 Nov):
--35.92 vs the starter's -43.51 and the best house entry's -37.2.
-
-Inputs: $MAKEFUN_INPUT_DIR/history.ndjson + task.json (window read from
-task.json, never hardcoded). Output: $MAKEFUN_OUTPUT_DIR/forecast.json.
-Python 3.13, standard library only, deterministic, no network.
+Inputs: MAKEFUN_INPUT_DIR (history.ndjson, task.json) — window read from
+task.json, never hardcoded. Output: MAKEFUN_OUTPUT_DIR/forecast.json.
+Stdlib only, deterministic.
 """
 import json
 import math
@@ -42,11 +25,12 @@ from datetime import datetime, timezone
 
 # ---------------------------------------------------------------- parameters
 PARAMS = {
-    "VEL_WINDOW_H": 48.0,    # lookback (h) for velocity estimation
-    "VEL_HALF_LIFE_H": 24.0,  # exponential recency half-life for velocity fit
-    "SHRINK": 0.0,           # momentum shrink (0 = no momentum; tuned: momentum hurts)
+    "VEL_WINDOW_H": 12.0,    # lookback (h) for velocity estimation (v2: short window)
+    "VEL_HALF_LIFE_H": 6.0,  # exponential recency half-life for velocity fit
+    "SHRINK": 0.3,           # momentum shrink (v2: short-window momentum helps)
     "DRIFT_TAU_H": 12.0,     # momentum saturation timescale (h)
     "DRIFT_MAX": 3.0,         # max total drift (ranks) over the window
+    "DRIFT_DECAY_H": 0.0,     # drift decay timescale (h); 0 = no decay
     "SIGMA_H": 0.90,          # diffusion: ranks per sqrt(hour)
     "SIGMA_CAP": 5.0,         # max sigma (ranks)
     "SIGMA_TOP_MULT": 0.3,    # sigma multiplier for ranks 1-2 (sticky top)
@@ -67,6 +51,17 @@ PARAMS = {
     "MAXNAMED": 30,           # max named games per place in the output
     "MIN_P": 0.001,           # drop output rows below this p
     "RANK_GRID": 45,          # ranks modelled explicitly (1..45); rest = out
+    # --- v2 additions (defaults = v1 behaviour unless noted) ---
+    "PLAY_WINDOW_H": 24.0,    # lookback (h) for playing-count growth
+    "PLAY_DRIFT": 0.0,        # ranks of drift per unit log-playing growth (v2: NOT used)
+    "PLAY_DRIFT_MAX": 3.0,    # cap on |playing drift| (ranks)
+    "AGE_YOUNG": 1.0,         # exit multiplier, age < 14d (v2: NOT used)
+    "AGE_MID": 1.0,           # exit multiplier, age 21-25d (v2: NOT used)
+    "AGE_OLD": 1.0,           # exit multiplier, age >= 25d (v2: NOT used)
+    "LAND_SHIFT": 2.0,        # entrant landing mean = origin rank - LAND_SHIFT (v2: was 6.0)
+    "LAND_SIGMA": 1.5,        # entrant landing spread (v2: was 2.0)
+    "DETHRONE": None,         # {rank: share} for a dethroned #1 (+ "out"); None = v1 default
+    "CREATED": None,          # {universe_id: ISO created} for the age hazard
 }
 RANK_GRID = PARAMS["RANK_GRID"]
 
@@ -86,6 +81,35 @@ def load_history(input_dir):
     with open(os.path.join(input_dir, "task.json")) as f:
         task = json.load(f)
     return reads, task
+
+
+def collect_created(reads):
+    """created dates from any read's details block (house recorder reads)."""
+    created = {}
+    for r in reads:
+        det = r.get("details")
+        if isinstance(det, dict):
+            for k, v in det.items():
+                if isinstance(v, dict) and v.get("created"):
+                    try:
+                        created[int(k)] = v["created"]
+                    except (TypeError, ValueError):
+                        pass
+    return created
+
+
+def playing_growth(pts, t0, window_h):
+    """Log playing growth over the last window_h hours.
+    pts: [(t, rank, playing)] sorted. Returns None if unusable."""
+    recent = [(t, p) for t, _, p in pts
+              if 0 <= (t0 - t).total_seconds() / 3600 <= window_h and p]
+    if len(recent) < 2:
+        return None
+    p_now = recent[-1][1]
+    p_old = recent[0][1]
+    if not p_now or not p_old or p_now <= 0 or p_old <= 0:
+        return None
+    return math.log(p_now + 1) - math.log(p_old + 1)
 
 
 def norm_pdf(x, mu, sigma):
@@ -118,14 +142,36 @@ def build_forecast(reads, task, P=None):
     last_rank = {g["universe_id"]: g["rank"] for g in last_chart}
     last_time = parse_time(last["at"])
 
-    # per-game rank history (time, rank)
+    # per-game rank history (time, rank, playing)
     hist = {}
     for r in reads:
         t = parse_time(r["at"])
         for g in r["up_and_coming"]:
-            hist.setdefault(g["universe_id"], []).append((t, g["rank"]))
+            hist.setdefault(g["universe_id"], []).append((t, g["rank"], g.get("playing")))
     for u in hist:
         hist[u].sort()
+
+    # created dates for the age hazard: from params (backtest) or details
+    created = P.get("CREATED") or collect_created(reads)
+    created_dt = {}
+    for u, v in (created or {}).items():
+        try:
+            created_dt[int(u)] = parse_time(v) if isinstance(v, str) else v
+        except (TypeError, ValueError):
+            pass
+
+    def age_mult(u):
+        c = created_dt.get(int(u))
+        if c is None:
+            return 1.0
+        age_d = (t_end - c).total_seconds() / 86400.0
+        if age_d < 14:
+            return P["AGE_YOUNG"]
+        if age_d < 21:
+            return 1.0
+        if age_d < 25:
+            return P["AGE_MID"]
+        return P["AGE_OLD"]
 
     # reign age of the #1 game (hours it has held #1 consecutively)
     top1 = last_chart[0]["universe_id"]
@@ -141,19 +187,23 @@ def build_forecast(reads, task, P=None):
     # candidate set: last rank <= 40, or top-20 in last 48h, ranked by adjusted rank
     cand = set(u for u, r in last_rank.items() if r <= P["CANDIDATE_TOP_N"])
     for u, pts in hist.items():
-        if any(r <= 20 and (t_end - t).total_seconds() / 3600 <= 48 for t, r in pts):
+        if any(r <= 20 and (t_end - t).total_seconds() / 3600 <= 48 for t, r, _ in pts):
             cand.add(u)
-    # velocity + adjusted rank for ordering
+    # velocity + playing drift + adjusted rank for ordering
     vel = {}
+    play_drift = {}
     adj = {}
     for u in cand:
         pts = hist.get(u, [])
-        times = [t for t, _ in pts]
-        ranks = [r for _, r in pts]
+        times = [t for t, _, _ in pts]
+        ranks = [r for _, r, _ in pts]
         v = velocity(times, ranks, t_end, P["VEL_WINDOW_H"], P["VEL_HALF_LIFE_H"])
         vel[u] = v if v is not None else 0.0
+        g = playing_growth(pts, t_end, P["PLAY_WINDOW_H"])
+        play_drift[u] = (max(-P["PLAY_DRIFT_MAX"], min(P["PLAY_DRIFT_MAX"], -P["PLAY_DRIFT"] * g))
+                         if g is not None else 0.0)
         r0 = last_rank.get(u, 40)
-        adj[u] = r0 + vel[u] * P["SHRINK"] * P["DRIFT_TAU_H"]
+        adj[u] = r0 + vel[u] * P["SHRINK"] * P["DRIFT_TAU_H"] + play_drift[u]
     cand = sorted(cand, key=lambda u: adj[u])[: P["CANDIDATE_TOP_N"]]
 
     # per-game horizon-averaged rank distribution over 1..RANK_GRID (+ out)
@@ -162,12 +212,17 @@ def build_forecast(reads, task, P=None):
     for u in cand:
         r0 = last_rank.get(u, 40)
         v = vel[u]
-        drift_total = max(-P["DRIFT_MAX"], min(P["DRIFT_MAX"], v * P["SHRINK"] * P["DRIFT_TAU_H"]))
+        drift_total = max(-P["DRIFT_MAX"], min(P["DRIFT_MAX"], v * P["SHRINK"] * P["DRIFT_TAU_H"])) + play_drift[u]
+        drift_total = max(-P["DRIFT_MAX"] - P["PLAY_DRIFT_MAX"],
+                          min(P["DRIFT_MAX"] + P["PLAY_DRIFT_MAX"], drift_total))
         acc = [0.0] * (RANK_GRID + 1)  # index 0 unused; RANK_GRID = out bucket
         out_mass = 0.0
         for h in horizons:
-            # saturating drift + diffusion
+            # saturating drift + diffusion; drift decays at long horizons
+            # (momentum is a short-horizon signal) when DRIFT_DECAY_H > 0
             frac = 1 - math.exp(-h / P["DRIFT_TAU_H"])
+            if P.get("DRIFT_DECAY_H"):
+                frac *= math.exp(-h / P["DRIFT_DECAY_H"])
             mu = r0 + drift_total * frac
             mu = max(1.0, min(float(RANK_GRID), mu))
             mult = (P["SIGMA_TOP_MULT"] if r0 <= 2 else
@@ -192,16 +247,20 @@ def build_forecast(reads, task, P=None):
                 else:
                     p_exit = (rank1_exit_24h if r0 == 1 else
                               min(0.6, P["EXIT_BASE_24H"] + P["EXIT_SLOPE_24H"] * (r0 - 1)))
+                if r0 != 1:
+                    p_exit = min(0.98, p_exit * age_mult(u))
                 p_exit = min(0.98, p_exit)
                 e = 1 - (1 - p_exit) ** f
                 moved = sum(dist[1:11]) * e
                 for k in range(1, 11):
                     dist[k] *= (1 - e)
                 if r0 == 1:
-                    # a dethroned #1 usually falls to #2-5 (70%) or vanishes (30%)
-                    for k, w in ((2, 0.28), (3, 0.18), (4, 0.14), (5, 0.10)):
+                    # a dethroned #1 usually falls to #2 (measured 7/8) or #3
+                    deth = P.get("DETHRONE") or {2: 0.28, 3: 0.18, 4: 0.14, 5: 0.10}
+                    out_share = 1.0 - sum(deth.values())
+                    for k, w in deth.items():
                         dist[k] += moved * w
-                    p_out += moved * 0.30
+                    p_out += moved * out_share
                 else:
                     # spread over ranks 11-30, decaying weights summing to 1
                     ws = {k: 0.5 ** ((k - 11) / 4.0) for k in range(11, 31)}
@@ -225,12 +284,12 @@ def build_forecast(reads, task, P=None):
                 for k in range(11, RANK_GRID + 1):
                     dist[k] *= (1 - e)
                 p_out *= (1 - e)
-                # Entrants land near origin rank - 6 (spread sigma 2, places 1-10)
-                mu_land = max(2.0, r0 - 6)
+                # Entrants land near origin rank - LAND_SHIFT (measured: 11-13 -> ~9)
+                mu_land = max(2.0, r0 - P["LAND_SHIFT"])
                 lw = {}
                 ltot = 0.0
                 for k in range(1, 11):
-                    lw[k] = norm_pdf(float(k), mu_land, 2.0)
+                    lw[k] = norm_pdf(float(k), mu_land, P["LAND_SIGMA"])
                     ltot += lw[k]
                 for k in range(1, 11):
                     dist[k] += moved * lw[k] / ltot
@@ -269,7 +328,7 @@ def build_forecast(reads, task, P=None):
                 kept.append([int(u), p])
         # Renormalise after the MIN_P cut so the named rows at this place
         # sum to exactly 1 - UNNAMED (the cut otherwise leaves places 1-4
-        # a touch below target — measured 0.7480-0.7487 instead of 0.75 —
+        # a touch below target — measured 0.7477-0.7489 instead of 0.75 —
         # inflating the unnamed share).
         kept_sum = sum(p for _, p in kept)
         if kept_sum > 0:
@@ -295,21 +354,6 @@ def main():
         params = json.loads(sys.argv[1])
     reads, task = load_history(input_dir)
     fc = build_forecast(reads, task, params)
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, task["output"]), "w") as f:
-        f.write(json.dumps(fc) + "\n")
-    print(f"wrote {len(fc['probabilities'])} rows, top10={fc['top10']}")
-
-
-if __name__ == "__main__":
-    main()
-
-
-def main():
-    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    reads, task = load_history(input_dir)
-    fc = build_forecast(reads, task)
     os.makedirs(output_dir, exist_ok=True)
     with open(os.path.join(output_dir, task["output"]), "w") as f:
         f.write(json.dumps(fc) + "\n")
