@@ -261,11 +261,23 @@ def build_forecast(reads, task, P=None):
         # scale named mass to (1 - UNNAMED), then flat-mix toward uniform
         target = 1.0 - P["UNNAMED"]
         uni = target / len(cands) if cands else 0.0
+        kept = []
         for u in cands:
             base = probs[k][u] / named_sum * target if named_sum > 0 else uni
             p = (1 - alpha) * base + alpha * uni
             if p >= P["MIN_P"]:
-                out_rows.append({"universe_id": int(u), "place": k, "p": round(p, 6)})
+                kept.append([int(u), p])
+        # Renormalise after the MIN_P cut so the named rows at this place
+        # sum to exactly 1 - UNNAMED (the cut otherwise leaves places 1-4
+        # a touch below target — measured 0.7480-0.7487 instead of 0.75 —
+        # inflating the unnamed share).
+        kept_sum = sum(p for _, p in kept)
+        if kept_sum > 0:
+            scale = target / kept_sum
+            for row in kept:
+                row[1] = round(row[1] * scale, 6)
+        for u, p in kept:
+            out_rows.append({"universe_id": u, "place": k, "p": p})
     # top10 by expected rank (lowest mean rank over averaged distribution)
     def mean_rank(u):
         dist, out = avg[u]
